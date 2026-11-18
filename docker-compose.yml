@@ -15,6 +15,10 @@ services:
     environment:
       ORIGIN_BASE_URL: http://origin:8000
       CACHE_DIR: /cache
+      # Cache capacity limit in bytes (48MiB). Complete packages + in-flight
+      # fill reservations + purged packages still read by old clients never
+      # exceed this; over-limit downloads get 507 until space is freed.
+      CACHE_MAX_BYTES: "50331648"
     volumes:
       - proxy-cache:/cache   # complete packages survive restarts
     ports:

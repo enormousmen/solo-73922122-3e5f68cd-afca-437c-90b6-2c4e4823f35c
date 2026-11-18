@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 PKG_DIR = Path(os.environ.get("PKG_DIR", "./packages")).resolve()
 DEFAULT_PACKAGES = {
     "pkg-32m.bin": 32 * 1024 * 1024,
+    "pkg-24m.bin": 24 * 1024 * 1024,
     "pkg-1m.bin": 1 * 1024 * 1024,
 }
 
@@ -28,6 +29,7 @@ _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._~!$&'()*+,;=:@-]+\Z")
 
 behavior = {
     "chunk_delay_ms": 0,
+    "header_delay_ms": 0,
     "truncate_after_bytes": None,  # int | None
     "chunk_size": 256 * 1024,
 }
@@ -112,6 +114,9 @@ async def get_package(path: str):
 
     size = p.stat().st_size
     beh = dict(behavior)  # snapshot for this request
+    header_delay = max(0, int(beh["header_delay_ms"])) / 1000.0
+    if header_delay:
+        await asyncio.sleep(header_delay)  # slow origin: headers arrive late
 
     async def body():
         sent = 0
@@ -145,6 +150,7 @@ async def get_package(path: str):
 
 class Behavior(BaseModel):
     chunk_delay_ms: int = Field(0, ge=0, description="sleep per streamed chunk")
+    header_delay_ms: int = Field(0, ge=0, description="sleep before response headers")
     truncate_after_bytes: int | None = Field(
         None, ge=0, description="abort the stream after this many bytes"
     )

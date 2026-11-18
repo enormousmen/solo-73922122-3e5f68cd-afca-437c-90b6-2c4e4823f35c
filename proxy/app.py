@@ -16,6 +16,14 @@ Design notes
 * Origin failure fails every attached download and never leaves a cached
   half-package. Startup deletes leftover ``.part-*`` files and keeps complete
   packages.
+* Capacity: at most CACHE_MAX_BYTES (default 48MiB) may be charged at any
+  moment -- complete packages + whole-package reservations of in-flight
+  fills + purged generations still held by old readers. A fill reserves the
+  origin's Content-Length before the first byte is written; if space is
+  short it evicts least-recently-downloaded complete packages that nobody
+  is reading, and if that is still not enough every attached download gets
+  507 before any body byte and no partial file is left behind. Packages
+  kept on disk across restarts are adopted at boot and count immediately.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 
 ORIGIN_BASE_URL = os.environ.get("ORIGIN_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache")).resolve()
+CACHE_MAX_BYTES = int(os.environ.get("CACHE_MAX_BYTES", str(48 * 1024 * 1024)))
 CHUNK = 256 * 1024  # bytes per origin read / client write / disk read
 
 _SEGMENT_RE = re.compile(r"\A[A-Za-z0-9._~!$&'()*+,;=:@-]+\Z")
@@ -81,6 +90,9 @@ class Entry:
         self.readers = 0
         self.written = 0          # bytes flushed to the part file so far
         self.size = -1            # expected total bytes (-1 = not known yet)
+        self.reserved = 0         # bytes reserved against the capacity limit
+        self.quota_exceeded = False  # fill failed: no room even after eviction
+        self.last_access = time.time()  # evict the least-recently-downloaded
         self.error: str | None = None
         self.origin_status: int | None = None
         self.headers_known = False
@@ -100,6 +112,15 @@ class Entry:
     def meta_path(self) -> Path:
         return CACHE_DIR / f"{self.key}.meta"
 
+    @property
+    def charged(self) -> int:
+        """Bytes this generation currently costs against the capacity limit."""
+        if self.state == "filling":
+            return self.reserved  # whole package reserved up front
+        if self.state == "complete":
+            return self.size  # includes purged generations kept for readers
+        return self.written  # closed/failed: partial file kept until reaped
+
     def info(self) -> dict:
         return {
             "state": self.state,
@@ -107,6 +128,9 @@ class Entry:
             "readers": self.readers,
             "written": self.written,
             "size": self.size,
+            "reserved": self.reserved,
+            "charged": self.charged,
+            "last_access": self.last_access,
             "gen": self.gen,
             "error": self.error,
         }
@@ -115,6 +139,10 @@ class Entry:
 class Cache:
     def __init__(self) -> None:
         self.entries: dict[str, Entry] = {}
+        # Every generation that still costs quota: registered entries plus
+        # purged/failed ones whose files survive for their last readers.
+        self.live: set[Entry] = set()
+        self.limit = CACHE_MAX_BYTES
         self.lock = asyncio.Lock()
         self.session: aiohttp.ClientSession | None = None
 
@@ -123,7 +151,7 @@ class Cache:
     # ------------------------------------------------------------------ #
 
     def _entry_from_disk(self, key: str) -> Entry | None:
-        """Adopt a complete on-disk package (e.g. after a restart)."""
+        """Adopt a complete on-disk package (boot-time scan only)."""
         final = CACHE_DIR / key
         try:
             st = final.stat()
@@ -136,25 +164,46 @@ class Cache:
         e.size = st.st_size
         e.written = st.st_size
         e.headers_known = True
+        e.last_access = st.st_mtime  # best available "last downloaded" hint
         try:
             e.meta = json.loads(e.meta_path.read_text())
         except (OSError, ValueError):
             e.meta = {}
         e.meta.setdefault("content_type", "application/octet-stream")
         self.entries[key] = e
+        self.live.add(e)
         return e
 
+    def adopt_disk_entries(self) -> None:
+        """Register every complete on-disk package at boot so retained
+        packages count against the capacity limit from the start."""
+        for p in sorted(CACHE_DIR.rglob("*")):
+            if not p.is_file():
+                continue
+            name = p.name
+            if ".part-" in name or name.endswith(".meta"):
+                continue
+            key = p.relative_to(CACHE_DIR).as_posix()
+            if key not in self.entries:
+                self._entry_from_disk(key)
+
     async def attach(self, key: str) -> Entry:
-        """Return the current generation for key, starting a fill if needed."""
+        """Return the current generation for key, starting a fill if needed.
+
+        Complete packages on disk are all registered at boot, so a key that
+        is missing here means "not cached": start a new fill. Never adopt
+        ad-hoc disk files -- a purged generation's file may still exist for
+        its last readers and must not be resurrected.
+        """
         async with self.lock:
             e = self.entries.get(key)
             if e is None:
-                e = self._entry_from_disk(key)
-            if e is None:
                 e = Entry(key)
                 self.entries[key] = e
+                self.live.add(e)
                 e.fill_task = asyncio.create_task(self._fill(e))
             e.readers += 1
+            e.last_access = time.time()
             return e
 
     async def detach(self, e: Entry) -> None:
@@ -191,10 +240,55 @@ class Cache:
             return
         if e.state == "failed":
             _unlink_quiet(e.part_path)  # never keep a half package
+            self.live.discard(e)
         elif e.purged:  # complete or closed
             _unlink_quiet(e.part_path)
             _unlink_quiet(e.final_path)
             _unlink_quiet(e.meta_path)
+            self.live.discard(e)
+
+    # ------------------------------------------------------------------ #
+    # capacity accounting                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _used_locked(self) -> int:
+        """Bytes currently charged: complete packages + fill reservations
+        + purged generations still held by old readers."""
+        return sum(e.charged for e in self.live)
+
+    def _pick_victim_locked(self, protect: Entry) -> Entry | None:
+        """Least-recently-downloaded complete package nobody is reading."""
+        best: Entry | None = None
+        for x in self.entries.values():
+            if x is protect or x.state != "complete" or x.readers > 0:
+                continue
+            if best is None or x.last_access < best.last_access:
+                best = x
+        return best
+
+    def _evict_locked(self, victim: Entry) -> None:
+        self.entries.pop(victim.key, None)
+        victim.purged = True
+        self._maybe_reap_locked(victim)  # readers == 0: files go now
+
+    def _try_reserve_locked(self, e: Entry, n: int) -> bool:
+        """Reserve n bytes for e's fill, evicting LRU complete packages.
+
+        Eviction never interrupts a reader: only complete packages with
+        zero readers are candidates, so filling entries and purged
+        generations kept alive by old readers are untouchable. If
+        reclaiming everything evictable still leaves no room, nothing is
+        reserved and the caller fails the fill with 507.
+        """
+        if n > self.limit:
+            return False  # can never fit; keep the existing cache
+        while self._used_locked() + n > self.limit:
+            victim = self._pick_victim_locked(protect=e)
+            if victim is None:
+                return False
+            self._evict_locked(victim)
+        e.reserved = n
+        return True
 
     # ------------------------------------------------------------------ #
     # origin fill                                                         #
@@ -211,7 +305,23 @@ class Cache:
                     await self._finish(e, "failed")
                     return
                 cl = resp.content_length
-                e.size = cl if cl is not None else -1
+                if cl is None:
+                    e.error = "origin sent no Content-Length; cannot reserve cache space"
+                    await self._finish(e, "failed")
+                    return
+                # Reserve the whole package before a single byte is written.
+                async with self.lock:
+                    reserved = self._try_reserve_locked(e, cl)
+                    if reserved:
+                        e.size = cl
+                if not reserved:
+                    e.quota_exceeded = True
+                    e.error = (
+                        f"package needs {cl} bytes, limit is {self.limit} "
+                        f"bytes and not enough is evictable"
+                    )
+                    await self._finish(e, "failed")
+                    return
                 e.meta = {
                     "content_type": resp.headers.get("Content-Type")
                     or "application/octet-stream",
@@ -235,12 +345,11 @@ class Cache:
                             e.cond.notify_all()
                 finally:
                     await asyncio.to_thread(f.close)
-                if e.size != -1 and written != e.size:
+                if written != e.size:
                     raise aiohttp.ClientPayloadError(
                         f"short read from origin: {written}/{e.size} bytes"
                     )
             async with self.lock:
-                e.size = written if e.size == -1 else e.size
                 e.meta["size"] = written
                 if e.purged:
                     # Purged mid-fill: keep the part file for current readers
@@ -335,6 +444,7 @@ def cleanup_cache_dir() -> None:
 async def lifespan(app: FastAPI):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_cache_dir()
+    cache.adopt_disk_entries()  # retained packages count against the limit
     timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)
     cache.session = aiohttp.ClientSession(timeout=timeout)
     try:
@@ -373,6 +483,12 @@ async def get_package(path: str):
 
     if entry.state == "failed":
         await cache.detach(entry)
+        if entry.quota_exceeded:
+            # 507 before any body byte; the failed fill left no partial
+            # file, and the next GET retries once space is freed.
+            return PlainTextResponse(
+                f"cache capacity exceeded: {entry.error}", status_code=507
+            )
         status = (
             entry.origin_status
             if entry.origin_status and entry.origin_status != 200
@@ -409,3 +525,16 @@ async def purge_package(path: str):
 async def cache_status():
     async with cache.lock:
         return {k: e.info() for k, e in cache.entries.items()}
+
+
+@app.get("/cache/quota")
+async def cache_quota():
+    """Capacity accounting: limit, bytes charged, bytes still free."""
+    async with cache.lock:
+        used = cache._used_locked()
+        return {
+            "limit_bytes": cache.limit,
+            "used_bytes": used,
+            "free_bytes": max(0, cache.limit - used),
+            "live_entries": len(cache.live),
+        }
